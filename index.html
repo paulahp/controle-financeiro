@@ -49,8 +49,10 @@ let CATS   = JSON.parse(JSON.stringify(DEF_CATS));
 let MONTHS = {};
 let FIXOS  = {};
 let INVEST = {};
+let MANUAL = {};   // manual card entries: key -> {cartao:'Neon', transactions:[]}
 let _uid   = null;
 let _pendingTx = null;
+let _pendingCartao = 'Inter'; // which card is being imported
 let _modalCats = [];
 let _ch1=null,_ch2=null,_ch3=null,_chDemo=null;
 
@@ -138,6 +140,11 @@ async function loadAll(){
     MONTHS={}; mSnap.forEach(d=>MONTHS[d.id]=d.data());
     FIXOS={};  fSnap.forEach(d=>FIXOS[d.id]=d.data());
     INVEST={}; iSnap.forEach(d=>INVEST[d.id]=d.data());
+    // Load manual cards
+    try{
+      const manSnap=await getDocs(collection(db,'users',_uid,'manual'));
+      MANUAL={}; manSnap.forEach(d=>MANUAL[d.id]=d.data());
+    }catch(e){}
   }catch(e){ toast('⚠️ Erro ao carregar: '+e.message,'warn'); }
   showLoader(false);
 }
@@ -152,7 +159,7 @@ onAuthStateChanged(auth, async user=>{
     document.getElementById('uAvatar').style.display=user.photoURL?'block':'none';
     document.getElementById('uName').textContent=user.displayName?.split(' ')[0]||'';
     await loadAll();
-    renderDashboard(); renderHistorico(); loadFixos(); loadInvest();
+    renderDashboard(); renderHistorico(); loadFixos(); loadReceitas(); loadInvest();
   } else {
     _uid=null;
     document.getElementById('loginScreen').style.display='flex';
@@ -323,6 +330,32 @@ window.txChangeNote=inp=>{
   const i=parseInt(inp.dataset.i);
   if(!isNaN(i)&&_pendingTx[i]) _pendingTx[i].note=inp.value;
 };
+window.toggleCardMode=()=>{
+  const cartao=document.getElementById('rvCartao')?.value||'Inter';
+  const isManual = cartao !== 'Inter';
+  document.getElementById('dropzoneWrap').style.display = isManual?'none':'block';
+  document.getElementById('manualCardPanel').style.display = isManual?'block':'none';
+  const btn=document.getElementById('btnSaveCard');
+  btn.onclick = isManual ? window.saveManualCard : window.saveMonth;
+  btn.textContent = isManual ? '☁️ Salvar '+cartao : '☁️ Salvar na nuvem';
+  if(isManual){
+    document.getElementById('pdfStatus').style.display='none';
+    document.getElementById('reviewPanel').style.display='block';
+    // hide PDF-only sections
+    document.getElementById('rvKpis').style.display='none';
+    document.getElementById('rvBars').style.display='none';
+    document.querySelector('.filter-row').style.display='none';
+    document.querySelector('.tbl-wrap').style.display='none';
+    document.getElementById('memoryBadge').style.display='none';
+    loadManualCard();
+  } else {
+    document.getElementById('rvKpis').style.display='';
+    document.getElementById('rvBars').style.display='';
+    document.querySelector('.filter-row').style.display='';
+    document.querySelector('.tbl-wrap').style.display='';
+    if(!_pendingTx) document.getElementById('reviewPanel').style.display='none';
+  }
+};
 window.cancelReview=()=>{ document.getElementById('reviewPanel').style.display='none'; _pendingTx=null; };
 
 // ═══════ SAVE MONTH (with updated categories) ═══════
@@ -340,13 +373,69 @@ window.saveMonth=async()=>{
   });
   const byCat={}; _pendingTx.forEach(t=>{ byCat[t.category]=(byCat[t.category]||0)+Math.abs(t.amount); });
   const total=_pendingTx.reduce((s,t)=>s+Math.abs(t.amount),0);
-  const data={transactions:[..._pendingTx],byCat,total,label:keyLabel(key),note:monthNote,savedAt:new Date().toISOString()};
+  const cartaoNome=document.getElementById('rvCartao')?.value||'Inter';
+  const data={transactions:[..._pendingTx],byCat,total,cartao:cartaoNome,label:keyLabel(key),note:monthNote,savedAt:new Date().toISOString()};
   MONTHS[key]=data;
   try{ await setDoc(mRef(key),data); toast(`✅ <strong>${keyLabel(key)}</strong> salvo!`); }
   catch(e){ toast('⚠️ Erro: '+e.message,'warn'); }
   cancelReview();
   document.getElementById('pdfStatus').style.display='none';
   document.getElementById('fileInput').value='';
+};
+
+// ═══════ MANUAL CARDS (Neon, Carrefour etc) ═══════
+const manRef = k => doc(db,'users',_uid,'manual',k);
+
+window.loadManualCard=()=>{
+  const m=document.getElementById('rvMonth').value, y=document.getElementById('rvYear').value;
+  const key=mkKey(y,m);
+  const cartao=document.getElementById('rvCartao').value;
+  const data=MANUAL[key]||{entries:[]};
+  const entry=data.entries?.find(e=>e.cartao===cartao)||{cartao,transactions:[]};
+  renderManualTx(entry.transactions||[]);
+};
+function renderManualTx(txs){
+  document.getElementById('manualTxList').innerHTML = txs.length
+    ? txs.map((t,i)=>`
+      <div class="tbl-row tbl-cols-tx5" data-mi="${i}">
+        <input class="f-input" style="font-size:11px;padding:4px 7px" placeholder="dd/mm" value="${t.date||''}">
+        <span>
+          <input class="f-input" style="font-size:11px;padding:4px 7px" placeholder="Descrição" value="${t.desc||''}">
+          <input class="note-inp" placeholder="+ nota" value="${t.note||''}" data-mi="${i}">
+        </span>
+        <select class="cat-select" style="font-size:11px" data-mi="${i}">${allLabels().map(l=>`<option value="${l}"${l===t.category?' selected':''}>${l}</option>`).join('')}</select>
+        <span style="display:flex;gap:5px;align-items:center">
+          <input class="f-input" style="font-size:11px;padding:4px 7px;text-align:right" placeholder="0,00" value="${t.amount?Math.abs(t.amount).toFixed(2).replace('.',','):''}">
+          <button class="del-btn" onclick="rmManualTx(${i})">🗑</button>
+        </span>
+      </div>`).join('')
+    : '<div style="color:var(--muted);font-size:12px;padding:8px 4px">Nenhuma transação. Adicione abaixo.</div>';
+}
+window.addManualTx=()=>{
+  const txs=getManualTxs();
+  txs.push({date:'',desc:'',category:'❓ Outros',amount:0,note:''});
+  renderManualTx(txs);
+};
+window.rmManualTx=i=>{ const t=getManualTxs(); t.splice(i,1); renderManualTx(t); };
+function getManualTxs(){
+  return [...document.querySelectorAll('#manualTxList .tbl-row')].map(row=>{
+    const inps=[...row.querySelectorAll('input')];
+    const sel=row.querySelector('select');
+    return{date:inps[0]?.value||'',desc:inps[1]?.value||'',note:inps[2]?.value||'',category:sel?.value||'❓ Outros',amount:-(parseBRL(inps[3]?.value)||0),isCredit:false};
+  }).filter(t=>t.desc||Math.abs(t.amount)>0);
+}
+window.saveManualCard=async()=>{
+  const m=document.getElementById('rvMonth').value, y=document.getElementById('rvYear').value;
+  const key=mkKey(y,m);
+  const cartao=document.getElementById('rvCartao').value;
+  const txs=getManualTxs();
+  const existing=MANUAL[key]||{entries:[]};
+  const idx=existing.entries.findIndex(e=>e.cartao===cartao);
+  const entry={cartao,transactions:txs,total:txs.reduce((s,t)=>s+Math.abs(t.amount),0)};
+  if(idx>=0) existing.entries[idx]=entry; else existing.entries.push(entry);
+  MANUAL[key]=existing;
+  try{ await setDoc(manRef(key),existing); toast(`✅ ${cartao} de ${keyLabel(key)} salvo!`); }
+  catch(e){ toast('⚠️ '+e.message,'warn'); }
 };
 
 // ═══════ FIXOS PAGE (enhanced with paid check + dates) ═══════
@@ -502,7 +591,11 @@ window.renderDemo=()=>{
   const showCard  = document.getElementById('toggleCard')?.checked  ?? true;
   const showFixos = document.getElementById('toggleFixos')?.checked ?? true;
 
-  const cardTotal = (showCard  && month) ? month.total : 0;
+  // Sum all card sources for this month
+  const manualForMonth = MANUAL[key]; // {entries:[{cartao,transactions:[]}]}
+  const manualTotal = (showCard && manualForMonth)
+    ? (manualForMonth.entries||[]).reduce((s,e)=>s+e.transactions.reduce((ss,t)=>ss+Math.abs(t.amount),0),0) : 0;
+  const cardTotal = (showCard && month ? month.total : 0) + manualTotal;
   const fixoTotal = (showFixos && fixo)  ? (
     (fixo.fixos||[]).reduce((s,f)=>s+f.val,0) +
     (fixo.outrosCartoes||[]).reduce((s,f)=>s+f.val,0)
@@ -550,7 +643,7 @@ window.renderDemo=()=>{
       <span style="font-size:11px;color:var(--muted);margin-right:8px">Visualizar:</span>
       <label class="demo-toggle ${showCard?'on':''}">
         <input type="checkbox" id="toggleCard" ${showCard?'checked':''} onchange="renderDemo()">
-        💳 Cartão <strong>${month?fmtBRL(month.total):'—'}</strong>
+        💳 Cartão <strong>${fmtBRL((month?month.total:0)+(manualForMonth?(manualForMonth.entries||[]).reduce((s,e)=>s+e.total,0):0)||0)||'—'}</strong>
       </label>
       <label class="demo-toggle ${showFixos?'on':''}">
         <input type="checkbox" id="toggleFixos" ${showFixos?'checked':''} onchange="renderDemo()">
@@ -592,18 +685,21 @@ window.renderDemo=()=>{
       </div>`;
     }).join('')}</div>`:`<div class="alert info">Nenhum dado para a seleção atual.</div>`}
 
-    ${showCard&&month?.transactions?.length?`
+    ${showCard&&(month?.transactions?.length||(manualForMonth?.entries||[]).some(e=>e.transactions?.length))?`
     <div class="section-title" style="cursor:pointer" onclick="document.getElementById('txListDemo').style.display=document.getElementById('txListDemo').style.display==='none'?'block':'none'">
       📋 Transações do Cartão <span style="font-size:11px;color:var(--muted);font-weight:400">— clique para expandir</span>
     </div>
     <div id="txListDemo" style="display:none;margin-bottom:20px">
       <div class="card tbl-wrap">
         <div class="tbl-head tbl-cols-tx"><span>DATA</span><span>DESCRIÇÃO</span><span>CATEGORIA</span><span style="text-align:right">VALOR</span></div>
-        <div class="tbl-scroll">${month.transactions.map(t=>{
+        <div class="tbl-scroll">${[
+          ...(month?.transactions||[]).map(t=>({...t,_src:month.cartao||'Inter'})),
+          ...((manualForMonth?.entries||[]).flatMap(e=>(e.transactions||[]).map(t=>({...t,_src:e.cartao}))))
+        ].map(t=>{
           const info=getCatInfo(t.category);
           return `<div class="tbl-row tbl-cols-tx">
             <span class="date-muted">${t.date}</span>
-            <span><div class="desc-cell">${t.desc}</div>${t.note?`<div style="font-size:10px;color:var(--accent)">📝 ${t.note}</div>`:''}</span>
+            <span><div class="desc-cell">${t.desc}</div>${t.note?`<div style="font-size:10px;color:var(--accent)">📝 ${t.note}</div>`:''}<div style="font-size:9px;color:var(--muted)">${t._src}</div></span>
             <span style="font-size:11px;color:${info.color}">${t.category}</span>
             <span class="amt-red">${fmtBRL(Math.abs(t.amount))}</span>
           </div>`;
@@ -804,20 +900,24 @@ window.saveInvest=async()=>{
 
 // ═══════ HISTÓRICO ═══════
 window.renderHistorico=()=>{
-  const keys=Object.keys(MONTHS).sort().reverse();
+  // merge keys from MONTHS and MANUAL
+  const allKeys=[...new Set([...Object.keys(MONTHS),...Object.keys(MANUAL)])].sort().reverse();
+  const keys=allKeys;
   if(!keys.length){ document.getElementById('histList').innerHTML='<div class="alert info">Nenhum mês salvo ainda.</div>'; return; }
   document.getElementById('histList').innerHTML=keys.map(key=>{
-    const m=MONTHS[key], f=FIXOS[key];
+    const m=MONTHS[key], f=FIXOS[key], man=MANUAL[key];
     const receita=f?(f.receitas||[]).reduce((s,r)=>s+r.val,0):0;
     const fixoTotal=f?(f.fixos||[]).reduce((s,r)=>s+r.val,0):0;
-    const saldo=receita-(m?m.total:0)-fixoTotal;
+    const manualTotal=man?(man.entries||[]).reduce((s,e)=>s+e.total,0):0;
+    const saldo=receita-(m?m.total:0)-fixoTotal-manualTotal;
     return `<div class="hist-entry" id="he-${key}">
       <div class="hist-entry-hdr" onclick="toggleHist('${key}')">
         <div><div style="font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:700">${keyLabel(key)}</div>
         ${m?.note?`<div style="font-size:11px;color:var(--accent);margin-top:2px">📝 ${m.note}</div>`:''}
         <div style="font-size:11px;color:var(--muted);margin-top:2px">Salvo ${m?.savedAt?new Date(m.savedAt).toLocaleDateString('pt-BR'):'-'}</div></div>
         <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-          ${m?`<span style="font-size:12px;color:var(--accent)">Cartão: ${fmtBRL(m.total)}</span>`:''}
+          ${m?`<span style="font-size:12px;color:var(--accent)">${m.cartao||'Inter'}: ${fmtBRL(m.total)}</span>`:''}
+          ${man?(man.entries||[]).map(e=>`<span style="font-size:12px;color:var(--accent)">${e.cartao}: ${fmtBRL(e.total)}</span>`).join(''):'' }
           ${fixoTotal?`<span style="font-size:12px;color:var(--blue)">Fixos: ${fmtBRL(fixoTotal)}</span>`:''}
           ${receita?`<span style="font-size:12px;color:var(--green)">Receita: ${fmtBRL(receita)}</span>`:''}
           <span style="font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:14px;color:${saldo>=0?'var(--green)':'var(--red)'}">${saldo>=0?'✅':'⚠️'} ${fmtBRL(saldo)}</span>
@@ -1139,11 +1239,11 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
 <!-- FATURA -->
 <div class="page" id="pg-fatura">
   <div class="section-title" style="margin-top:4px">📄 Importar Fatura</div>
-  <div id="dropzone" onclick="document.getElementById('fileInput').click()">
+  <div id="dropzoneWrap"><div id="dropzone" onclick="document.getElementById('fileInput').click()">
     <span class="dz-icon">📄</span><h3>Arraste o PDF da fatura aqui</h3>
     <p>ou clique para selecionar</p><span class="badge">Banco Inter • PDF</span>
     <input type="file" id="fileInput" accept=".pdf">
-  </div>
+  </div></div><!-- /dropzoneWrap -->
   <div id="pdfStatus"></div>
   <div id="reviewPanel" style="display:none">
     <h3>✅ Revise e salve</h3>
@@ -1155,6 +1255,13 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
           <option value="1">Janeiro</option><option value="2">Fevereiro</option><option value="3">Março</option><option value="4">Abril</option><option value="5">Maio</option><option value="6">Junho</option><option value="7">Julho</option><option value="8">Agosto</option><option value="9">Setembro</option><option value="10">Outubro</option><option value="11">Novembro</option><option value="12">Dezembro</option>
         </select></div>
       <div><div class="f-label">Ano</div><select class="f-select" id="rvYear" style="width:90px"></select></div>
+      <div><div class="f-label">💳 Cartão</div>
+        <select class="f-select" id="rvCartao" style="width:130px" onchange="toggleCardMode()">
+          <option value="Inter">Inter (PDF)</option>
+          <option value="Neon">Neon (manual)</option>
+          <option value="Carrefour">Carrefour (manual)</option>
+          <option value="Outro">Outro (manual)</option>
+        </select></div>
       <div style="flex:1;min-width:200px"><div class="f-label">📝 Descrição do mês (opcional)</div><input class="f-input" id="rvMonthNote" placeholder="Ex: Mês com viagem pra SP, comprei celular parcelado…"></div>
     </div>
     <div class="kpi-grid" id="rvKpis"></div>
@@ -1169,8 +1276,18 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
       <div class="tbl-head tbl-cols-tx5"><span>DATA</span><span>DESCRIÇÃO + NOTA</span><span>CATEGORIA</span><span style="text-align:right">VALOR</span></div>
       <div class="tbl-scroll" id="txTable"></div>
     </div>
+    <!-- MANUAL CARD PANEL (shown for non-Inter cards) -->
+    <div id="manualCardPanel" style="display:none">
+      <div class="section-title">✏️ Lançamentos manuais</div>
+      <div class="card tbl-wrap" style="margin-bottom:12px">
+        <div class="tbl-head tbl-cols-tx5"><span>DATA</span><span>DESCRIÇÃO + NOTA</span><span>CATEGORIA</span><span>VALOR</span></div>
+        <div style="padding:8px 14px" id="manualTxList"></div>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick="addManualTx()" style="margin-bottom:12px">+ Adicionar transação</button>
+    </div>
+
     <div style="display:flex;gap:9px;margin-top:14px;flex-wrap:wrap">
-      <button class="btn btn-primary" onclick="saveMonth()">☁️ Salvar na nuvem</button>
+      <button class="btn btn-primary" id="btnSaveCard" onclick="saveMonth()">☁️ Salvar na nuvem</button>
       <button class="btn btn-secondary" onclick="cancelReview()">✕ Cancelar</button>
     </div>
   </div>

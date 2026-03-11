@@ -361,12 +361,16 @@ window.loadFixos=()=>{
   renderFixos(data.fixos||[]);
   calcFixoTotal();
 };
+function fixoCatOpts(sel){
+  // Build category options from CATS for fixo rows
+  return CATS.map(c=>{const l=catLabel(c);return`<option value="${l}"${l===sel?' selected':''}>${l}</option>`;}).join('');
+}
 function renderFixos(items){
   document.getElementById('fixosList').innerHTML=items.map((item,i)=>`
     <div class="fixo-row" data-idx="${i}">
       <input class="f-input" placeholder="Descrição" value="${item.desc||''}" oninput="calcFixoTotal()">
       <input class="f-input" placeholder="R$ 0,00" value="${item.val?(item.val.toFixed(2).replace('.',',')):'0,00'}" style="text-align:right" oninput="calcFixoTotal()">
-      <input class="f-input" placeholder="Categoria" value="${item.cat||''}">
+      <select class="f-input cat-select" style="padding:6px 7px;cursor:pointer">${fixoCatOpts(item.cat||'')}</select>
       <input class="f-input" type="date" placeholder="Vencimento" value="${item.venc||''}" title="Data de vencimento">
       <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);white-space:nowrap;cursor:pointer">
         <input type="checkbox" ${item.pago?'checked':''} onchange="togglePago(${i},this)" style="accent-color:var(--green);width:14px;height:14px"> Pago
@@ -386,7 +390,8 @@ window.togglePago=(i,cb)=>{
 function getFixosData(){
   return [...document.querySelectorAll('.fixo-row')].map(row=>{
     const inp=row.querySelectorAll('input');
-    return{desc:inp[0].value,val:parseBRL(inp[1].value),cat:inp[2].value,venc:inp[3].value,pago:inp[4].checked,dtPago:inp[5].value};
+    const catSel=row.querySelector('select');
+    return{desc:inp[0].value,val:parseBRL(inp[1].value),cat:catSel?catSel.value:'',venc:inp[2].value,pago:inp[3].checked,dtPago:inp[4].value};
   });
 }
 window.calcFixoTotal=()=>{
@@ -461,99 +466,138 @@ window.renderDemo=()=>{
   const key=mkKey(y,m);
   const month=MONTHS[key], fixo=FIXOS[key];
   const el=document.getElementById('demoContent');
-
   if(!month&&!fixo){ el.innerHTML='<div class="alert info">Sem dados para este mês. Importe a fatura e cadastre os custos fixos.</div>'; return; }
 
-  const cardTotal=month?month.total:0;
-  const fixoTotal=fixo?(fixo.fixos||[]).reduce((s,f)=>s+f.val,0):0;
-  const receita=fixo?(fixo.receitas||[]).reduce((s,r)=>s+r.val,0):0;
-  const totalGasto=cardTotal+fixoTotal;
-  const saldo=receita-totalGasto;
-  const poupancaRate=receita>0?((receita-totalGasto)/receita*100):0;
+  // Read toggle state (default both on)
+  const showCard  = document.getElementById('toggleCard')?.checked  ?? true;
+  const showFixos = document.getElementById('toggleFixos')?.checked ?? true;
 
-  // Build byCat merged
+  const cardTotal = (showCard  && month) ? month.total : 0;
+  const fixoTotal = (showFixos && fixo)  ? (fixo.fixos||[]).reduce((s,f)=>s+f.val,0) : 0;
+  const receita   = fixo?(fixo.receitas||[]).reduce((s,r)=>s+r.val,0):0;
+  const totalGasto= cardTotal+fixoTotal;
+  const saldo     = receita-totalGasto;
+  const poupRate  = receita>0?((receita-totalGasto)/receita*100):0;
+
+  // byCat for bars (respects toggles)
   const byCat={};
-  if(month) Object.entries(month.byCat).forEach(([c,v])=>{ byCat[c]=(byCat[c]||0)+v; });
-  if(fixo) (fixo.fixos||[]).forEach(f=>{ const cat=f.cat||'🏠 Casa & Compras'; byCat[cat]=(byCat[cat]||0)+f.val; });
+  if(showCard  && month) Object.entries(month.byCat).forEach(([c2,v])=>{ byCat[c2]=(byCat[c2]||0)+v; });
+  if(showFixos && fixo)  (fixo.fixos||[]).forEach(f=>{ const cat=f.cat||'🏠 Casa & Compras'; byCat[cat]=(byCat[cat]||0)+f.val; });
   const sorted=Object.entries(byCat).sort((a,b)=>b[1]-a[1]);
 
-  // Insights
+  // Insights (always based on card only for reduction tips)
   const ins=[];
-  if(saldo<0) ins.push({type:'warn',icon:'🚨',title:'Gastou mais do que recebeu',body:`Déficit de <strong>${fmtBRL(Math.abs(saldo))}</strong>. Você precisa reduzir <strong>${fmtBRL(Math.abs(saldo)/30)}/dia</strong> nos próximos meses para equilibrar.`});
-  else ins.push({type:'ok',icon:'✅',title:'Mês no azul!',body:`Sobrou <strong>${fmtBRL(saldo)}</strong> — taxa de poupança de <strong>${poupancaRate.toFixed(0)}%</strong>. ${poupancaRate>=20?'Excelente!':'Meta: chegar a 20%.'}`});
-  if(sorted.length>0){
-    const[topCat,topVal]=sorted[0];
-    const pct=(topVal/totalGasto*100).toFixed(0);
-    ins.push({type:parseInt(pct)>30?'warn':'tip',icon:'🏆',title:`Maior gasto: ${topCat}`,body:`<strong>${fmtBRL(topVal)}</strong> — <strong>${pct}%</strong> de tudo que saiu. ${parseInt(pct)>30?`Se reduzir 20% aqui, economiza <strong>${fmtBRL(topVal*.2)}/mês</strong>.`:''}`});
+  if(saldo<0) ins.push({type:'warn',icon:'🚨',title:'Gastou mais do que recebeu',body:`Déficit de <strong>${fmtBRL(Math.abs(saldo))}</strong>. Reduzir <strong>${fmtBRL(Math.abs(saldo)/30)}/dia</strong> nos próximos meses equilibra.`});
+  else        ins.push({type:'ok', icon:'✅',title:'Mês no azul!',body:`Sobrou <strong>${fmtBRL(saldo)}</strong> — poupança de <strong>${poupRate.toFixed(0)}%</strong>. ${poupRate>=20?'Excelente!':'Meta: 20%.'}`});
+  const cardByCat={};
+  if(month) Object.entries(month.byCat).forEach(([c2,v])=>{ cardByCat[c2]=(cardByCat[c2]||0)+v; });
+  const topCard=Object.entries(cardByCat).sort((a,b)=>b[1]-a[1]);
+  if(topCard.length>0){
+    const[tc,tv]=topCard[0], pct=month?.total>0?(tv/month.total*100).toFixed(0):0;
+    ins.push({type:parseInt(pct)>30?'warn':'tip',icon:'🏆',title:`💳 Maior variável: ${tc}`,body:`<strong>${fmtBRL(tv)}</strong> — <strong>${pct}%</strong> do cartão. ${parseInt(pct)>30?`Reduzir 20% = <strong>${fmtBRL(tv*.2)}/mês</strong> a mais de poupança.`:''}`});
   }
-  if(cardTotal>0&&receita>0){
-    const cardPct=(cardTotal/receita*100).toFixed(0);
-    ins.push({type:parseInt(cardPct)>50?'warn':'tip',icon:'💳',title:'Cartão vs Receita',body:`O cartão consumiu <strong>${cardPct}%</strong> da sua renda. ${parseInt(cardPct)>50?`Meta: reduzir para menos de 40% (<strong>${fmtBRL(receita*.4)}</strong>).`:''}`});
+  if(fixo&&(fixo.fixos||[]).reduce((s,f)=>s+f.val,0)>0&&receita>0){
+    const fp=((fixo.fixos||[]).reduce((s,f)=>s+f.val,0)/receita*100).toFixed(0);
+    ins.push({type:parseInt(fp)>50?'warn':'ok',icon:'🏠',title:'Custos fixos',body:`Comprometem <strong>${fp}%</strong> da renda — são obrigações, não aparecem nos desafios de redução.`});
   }
-  // Challenge
-  const challenge = sorted.length>1 ? `🎯 <strong>Desafio do mês que vem:</strong> tente gastar <strong>${fmtBRL(sorted[0][1]*.9)}</strong> em ${sorted[0][0]} (−10% vs este mês). Isso libera <strong>${fmtBRL(sorted[0][1]*.1)}</strong> para sua reserva.` : '';
+  if(month?.total>0&&receita>0){
+    const cp=(month.total/receita*100).toFixed(0);
+    ins.push({type:parseInt(cp)>50?'warn':'tip',icon:'💳',title:'Cartão vs Receita',body:`Cartão consumiu <strong>${cp}%</strong> da renda.${parseInt(cp)>50?` Meta: abaixo de 40% (${fmtBRL(receita*.4)}).`:''}`});
+  }
+  const topForChallenge = topCard[0];
+  const challenge = topForChallenge ? `🎯 <strong>Desafio pro próximo mês:</strong> gastar <strong>${fmtBRL(topForChallenge[1]*.9)}</strong> em ${topForChallenge[0]} (−10%). Isso libera <strong>${fmtBRL(topForChallenge[1]*.1)}</strong> para a reserva.` : '';
 
-  el.innerHTML=`
-    <div class="kpi-grid">
+  // Render toggle bar only once (preserve state)
+  const toggleHtml=`
+    <div class="demo-toggles">
+      <span style="font-size:11px;color:var(--muted);margin-right:8px">Visualizar:</span>
+      <label class="demo-toggle ${showCard?'on':''}">
+        <input type="checkbox" id="toggleCard" ${showCard?'checked':''} onchange="renderDemo()">
+        💳 Cartão <strong>${month?fmtBRL(month.total):'—'}</strong>
+      </label>
+      <label class="demo-toggle ${showFixos?'on':''}">
+        <input type="checkbox" id="toggleFixos" ${showFixos?'checked':''} onchange="renderDemo()">
+        🏠 Fixos <strong>${fixo?fmtBRL((fixo.fixos||[]).reduce((s,f)=>s+f.val,0)):'—'}</strong>
+      </label>
+      ${receita>0?`<span class="demo-toggle" style="opacity:.7">💵 Receita <strong>${fmtBRL(receita)}</strong></span>`:''}
+    </div>`;
+
+  el.innerHTML=toggleHtml+`
+    <div class="kpi-grid" style="margin-top:14px">
       <div class="kpi green"><div class="k-label">Receita</div><div class="k-val">${fmtBRL(receita)}</div></div>
-      <div class="kpi red"><div class="k-label">Fixos</div><div class="k-val">${fmtBRL(fixoTotal)}</div></div>
-      <div class="kpi accent"><div class="k-label">Cartão</div><div class="k-val">${fmtBRL(cardTotal)}</div></div>
+      ${showFixos?`<div class="kpi red"><div class="k-label">Fixos</div><div class="k-val">${fmtBRL(fixoTotal)}</div></div>`:''}
+      ${showCard?`<div class="kpi accent"><div class="k-label">Cartão</div><div class="k-val">${fmtBRL(cardTotal)}</div></div>`:''}
       <div class="kpi ${saldo>=0?'green':'red'}"><div class="k-label">Saldo</div><div class="k-val">${fmtBRL(saldo)}</div></div>
-      <div class="kpi blue"><div class="k-label">% Poupança</div><div class="k-val">${poupancaRate.toFixed(0)}%</div><div class="k-sub">Meta: 20%</div></div>
+      <div class="kpi blue"><div class="k-label">% Poupança</div><div class="k-val">${poupRate.toFixed(0)}%</div><div class="k-sub">Meta: 20%</div></div>
     </div>
 
-    ${challenge?`<div class="alert warn" style="margin-bottom:16px">${challenge}</div>`:''}
+    ${challenge?`<div class="alert warn" style="margin-bottom:14px">${challenge}</div>`:''}
 
-    <div class="section-title">💸 Todos os Gastos por Categoria</div>
-    <div style="margin-bottom:20px">${sorted.map(([cat,val])=>{
-      const pct=(val/totalGasto*100).toFixed(1), info=getCatInfo(cat);
+    <div class="section-title">💸 Gastos por Categoria ${!showCard?'<span style="font-size:10px;color:var(--muted)">(somente fixos)</span>':!showFixos?'<span style="font-size:10px;color:var(--muted)">(somente cartão)</span>':''}</div>
+    ${sorted.length?`<div style="margin-bottom:20px">${sorted.map(([cat,val])=>{
+      const pct=totalGasto>0?(val/totalGasto*100).toFixed(1):0, info=getCatInfo(cat);
+      const isFixed = showFixos&&fixo&&(fixo.fixos||[]).some(f=>f.cat===cat||(f.cat||'🏠 Casa & Compras')===cat);
       return `<div class="bar-row">
-        <div class="bar-label">${cat}</div>
+        <div class="bar-label">${cat}${isFixed&&showCard?` <span style="font-size:9px;color:var(--blue);opacity:.7">fixo</span>`:''}</div>
         <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${info.color}"></div></div>
         <div class="bar-pct">${pct}%</div>
         <div class="bar-val">${fmtBRL(val)}</div>
-        <div style="font-size:10px;color:${val/receita>.15?'var(--red)':'var(--muted)'};width:36px;text-align:right">${receita>0?(val/receita*100).toFixed(0)+'% R':''}
-        </div>
+        ${receita>0?`<div style="font-size:10px;color:${val/receita>.15?'var(--red)':'var(--muted)'};width:38px;text-align:right">${(val/receita*100).toFixed(0)}% R</div>`:''}
       </div>`;
-    }).join('')}</div>
+    }).join('')}</div>`:`<div class="alert info">Nenhum dado para a seleção atual.</div>`}
+
+    ${showCard&&month?.transactions?.length?`
+    <div class="section-title" style="cursor:pointer" onclick="document.getElementById('txListDemo').style.display=document.getElementById('txListDemo').style.display==='none'?'block':'none'">
+      📋 Transações do Cartão <span style="font-size:11px;color:var(--muted);font-weight:400">— clique para expandir</span>
+    </div>
+    <div id="txListDemo" style="display:none;margin-bottom:20px">
+      <div class="card tbl-wrap">
+        <div class="tbl-head tbl-cols-tx"><span>DATA</span><span>DESCRIÇÃO</span><span>CATEGORIA</span><span style="text-align:right">VALOR</span></div>
+        <div class="tbl-scroll">${month.transactions.map(t=>{
+          const info=getCatInfo(t.category);
+          return `<div class="tbl-row tbl-cols-tx">
+            <span class="date-muted">${t.date}</span>
+            <span><div class="desc-cell">${t.desc}</div>${t.note?`<div style="font-size:10px;color:var(--accent)">📝 ${t.note}</div>`:''}</span>
+            <span style="font-size:11px;color:${info.color}">${t.category}</span>
+            <span class="amt-red">${fmtBRL(Math.abs(t.amount))}</span>
+          </div>`;
+        }).join('')}</div>
+      </div>
+    </div>`:''}
 
     <div class="section-title">💡 Insights & Sugestões</div>
     <div class="ins-grid">${ins.map(i=>`<div class="ins-card ${i.type}"><div class="i-t">${i.icon} ${i.title}</div><div class="i-b">${i.body}</div></div>`).join('')}</div>
 
     <div class="section-title">🌡️ Termômetro Financeiro</div>
-    <div class="card" style="padding:20px">
-      ${buildThermometer(receita,totalGasto,saldo)}
-    </div>
+    <div class="card" style="padding:20px">${buildThermometer(receita,fixoTotal,cardTotal,saldo)}</div>
   `;
-  setTimeout(()=>document.querySelectorAll('#demoContent .bar-fill').forEach(e=>{ if(!e.style.transition)e.style.transition='width 1s cubic-bezier(.16,1,.3,1)'; }),80);
+  setTimeout(()=>document.querySelectorAll('#demoContent .bar-fill').forEach(e=>{ e.style.transition='width 1s cubic-bezier(.16,1,.3,1)'; e.style.width=e.style.width; }),80);
 };
-function buildThermometer(receita,gasto,saldo){
+
+function buildThermometer(receita,gastoFixo,gastoCard,saldo){
   if(!receita) return '<p style="color:var(--muted);font-size:13px">Cadastre sua receita na aba Receitas para ver o termômetro.</p>';
-  const items=[
-    {label:'Fixos',val:0,color:'var(--blue)'},
-    {label:'Cartão',val:0,color:'var(--accent)'},
-    {label:'Poupança',val:Math.max(saldo,0),color:'var(--green)'},
-    {label:'Déficit',val:Math.max(-saldo,0),color:'var(--red)'},
-  ];
-  const pct=v=>(v/receita*100).toFixed(0);
-  const gastoFixo=FIXOS[mkKey(document.getElementById('demoYear').value,document.getElementById('demoMonth').value)]?.fixos?.reduce((s,f)=>s+f.val,0)||0;
-  const gastoCard=MONTHS[mkKey(document.getElementById('demoYear').value,document.getElementById('demoMonth').value)]?.total||0;
+  const pct=v=>Math.min((v/receita*100),100).toFixed(0);
+  const fixoPct=parseFloat(pct(gastoFixo)), cardPct=parseFloat(pct(gastoCard));
+  const resto=Math.max(100-fixoPct-cardPct,0);
   return `
     <div style="display:flex;flex-direction:column;gap:10px">
       <div>
-        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:5px"><span>Receita total: ${fmtBRL(receita)}</span><span>Comprometido: ${pct(gasto)}%</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:5px">
+          <span>Receita: ${fmtBRL(receita)}</span>
+          <span>Comprometido: ${(fixoPct+cardPct).toFixed(0)}%</span>
+        </div>
         <div style="height:28px;border-radius:10px;overflow:hidden;display:flex;background:var(--border)">
-          <div style="width:${Math.min(pct(gastoFixo),100)}%;background:var(--blue);display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;transition:width 1s">${pct(gastoFixo)>8?'Fixos':''}</div>
-          <div style="width:${Math.min(pct(gastoCard),100-Math.min(pct(gastoFixo),100))}%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;transition:width 1s">${pct(gastoCard)>8?'Cartão':''}</div>
+          <div style="width:${fixoPct}%;background:var(--blue);display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;transition:width 1s">${fixoPct>8?'Fixos':''}</div>
+          <div style="width:${cardPct}%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;transition:width 1s">${cardPct>8?'Cartão':''}</div>
           <div style="flex:1;background:${saldo>=0?'rgba(34,197,94,.3)':'rgba(239,68,68,.3)'};display:flex;align-items:center;justify-content:center;font-size:10px;color:${saldo>=0?'var(--green)':'var(--red)'}">${saldo>=0?'✅ Sobra':'⚠️ Déficit'}</div>
         </div>
         <div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap">
-          <span style="font-size:11px"><span style="display:inline-block;width:10px;height:10px;background:var(--blue);border-radius:2px;margin-right:4px"></span>Fixos ${pct(gastoFixo)}%</span>
-          <span style="font-size:11px"><span style="display:inline-block;width:10px;height:10px;background:var(--accent);border-radius:2px;margin-right:4px"></span>Cartão ${pct(gastoCard)}%</span>
-          <span style="font-size:11px;color:${saldo>=0?'var(--green)':'var(--red)'}"><span style="display:inline-block;width:10px;height:10px;background:${saldo>=0?'var(--green)':'var(--red)'};border-radius:2px;margin-right:4px"></span>${saldo>=0?'Poupança':'Déficit'} ${pct(Math.abs(saldo))}%</span>
+          <span style="font-size:11px"><span style="display:inline-block;width:10px;height:10px;background:var(--blue);border-radius:2px;margin-right:4px"></span>Fixos ${fixoPct}%</span>
+          <span style="font-size:11px"><span style="display:inline-block;width:10px;height:10px;background:var(--accent);border-radius:2px;margin-right:4px"></span>Cartão ${cardPct}%</span>
+          <span style="font-size:11px;color:${saldo>=0?'var(--green)':'var(--red)'}"><span style="display:inline-block;width:10px;height:10px;background:${saldo>=0?'var(--green)':'var(--red)'};border-radius:2px;margin-right:4px"></span>${saldo>=0?'Poupança':'Déficit'} ${Math.abs(100-fixoPct-cardPct).toFixed(0)}%</span>
         </div>
       </div>
-      <div style="font-size:12px;color:var(--muted);margin-top:4px">Regra 50/30/20 — Fixos devem ser ≤50%, variável ≤30%, poupança ≥20%</div>
+      <div style="font-size:11px;color:var(--muted)">Regra 50/30/20 — Fixos ≤50% · Variável ≤30% · Poupança ≥20%</div>
     </div>`;
 }
 
@@ -617,7 +661,7 @@ window.renderDashboard=()=>{
 
   const ins=[];
   if(cmpMs.length>=2){ const l=cmpMs[cmpMs.length-1],p=cmpMs[cmpMs.length-2]; const d=l.cardTotal-p.cardTotal; if(Math.abs(d)>50) ins.push({type:d>0?'warn':'ok',title:d>0?'📈 Gastos subindo':'📉 Gastos caindo',body:d>0?`+${fmtBRL(d)} vs mês anterior. Revise seus gastos variáveis.`:`Economizou ${fmtBRL(Math.abs(d))} no último mês! 🎉`}); }
-  if(topCats.length) ins.push({type:topCats[0][1]/annCard>0.35?'warn':'tip',title:`🏆 Top: ${topCats[0][0]}`,body:`${fmtBRL(topCats[0][1])} no ano — ${(topCats[0][1]/annCard*100).toFixed(0)}% do total do cartão.`});
+  if(topCats.length) ins.push({type:topCats[0][1]/annCard>0.35?'warn':'tip',title:`🏆 Top variável: ${topCats[0][0]}`,body:`${fmtBRL(topCats[0][1])} no ano — ${(topCats[0][1]/annCard*100).toFixed(0)}% do cartão. Gastos fixos são excluídos dos insights de redução por serem obrigações.`});
   if(annReceita>0){ const sr=((annReceita-annGasto)/annReceita*100).toFixed(0); ins.push({type:parseInt(sr)<10?'warn':parseInt(sr)>=20?'ok':'tip',title:'💰 Taxa de poupança anual',body:`${sr}% da renda poupada. ${parseInt(sr)<10?'⚠️ Meta: 20%.':parseInt(sr)>=20?'✅ Meta atingida!':'📌 Quase lá, meta é 20%.'}`}); }
   document.getElementById('dashInsights').innerHTML=ins.map(i=>`<div class="ins-card ${i.type}"><div class="i-t">${i.title}</div><div class="i-b">${i.body}</div></div>`).join('');
 };
@@ -828,6 +872,14 @@ window.saveCats=async()=>{
   CATS=_modalCats;
   try{ await setDoc(uRef(),{categories:CATS},{merge:true}); toast('✅ Categorias salvas!'); }catch(e){ toast('⚠️ '+e.message,'warn'); }
   closeCatManager();
+  // Rebuild fatura table so new cats appear in dropdowns immediately
+  if(_pendingTx && document.getElementById('reviewPanel').style.display!=='none'){
+    buildTxTable(_pendingTx);
+    const allCats=[...new Set(_pendingTx.map(t=>t.category))].sort();
+    document.getElementById('txCatFilter').innerHTML='<option value="">Todas</option>'+allCats.map(ct=>`<option>${ct}</option>`).join('');
+  }
+  // Re-render fixos so category selects update
+  if(document.getElementById('pg-fixos').classList.contains('active')) loadFixos();
 };
 window.resetCats=()=>{ if(!confirm('Restaurar padrão?'))return; _modalCats=JSON.parse(JSON.stringify(DEF_CATS)); renderCatList(); };
 document.getElementById('catModal').addEventListener('click',e=>{ if(e.target===document.getElementById('catModal'))closeCatManager(); });
@@ -922,6 +974,11 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
 .note-inp:focus{border-bottom-color:var(--accent);color:var(--text)}
 .note-inp::placeholder{color:rgba(107,114,128,.5)}
 .mem-badge{font-size:11px;background:rgba(34,197,94,.15);color:var(--green);border-radius:4px;padding:1px 5px;flex-shrink:0}
+.demo-toggles{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 16px;background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:4px}
+.demo-toggle{display:flex;align-items:center;gap:6px;font-size:12px;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--muted);cursor:pointer;transition:all .2s;user-select:none}
+.demo-toggle input{display:none}
+.demo-toggle.on{border-color:var(--accent);color:var(--text);background:rgba(249,115,22,.08)}
+.demo-toggle strong{font-family:'Syne',sans-serif}
 .cat-select{font-family:'DM Mono',monospace;font-size:11px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:3px 7px;cursor:pointer;outline:none;color:var(--text);transition:border-color .15s;width:148px}
 .cat-select:focus{border-color:var(--accent)}
 .date-muted{color:var(--muted);font-size:11px}

@@ -58,6 +58,42 @@ let _ch1=null,_ch2=null,_ch3=null,_chDemo=null;
 const catLabel   = c => c.emoji+' '+c.name;
 const getCatInfo = l => CATS.find(c=>catLabel(c)===l)||CATS.find(c=>c.name==='Outros')||{color:'#71717a'};
 const categorize = d => { const dl=d.toLowerCase(); for(const c of CATS){ if(c.name==='Outros')continue; if(c.keywords.some(k=>k&&dl.includes(k.trim().toLowerCase())))return catLabel(c); } return '❓ Outros'; };
+// ═══════ SMART MEMORY ═══════
+// Normalize description for matching: strip parcel info, lowercase, remove special chars
+function normDesc(d){
+  return d.toLowerCase()
+    .replace(/parcela?\s*\d+\s*(de\s*\d+)?/gi,'')  // remove "parcela X de Y"
+    .replace(/\d+\/\d+/g,'')                         // remove "08/10"
+    .replace(/\s+/g,' ').trim();
+}
+// Build a memory map from all saved months: normalized_desc -> {category, note, count}
+function buildMemory(){
+  const mem={};
+  Object.values(MONTHS).forEach(month=>{
+    (month.transactions||[]).forEach(t=>{
+      if(t.isCredit) return;
+      const norm=normDesc(t.desc);
+      if(!norm) return;
+      if(!mem[norm]) mem[norm]={category:t.category,note:t.note||'',count:0};
+      mem[norm].count++;
+      mem[norm].category=t.category; // most recent wins
+      if(t.note) mem[norm].note=t.note;
+    });
+  });
+  return mem;
+}
+// Find best match for a description in memory
+function memoryMatch(desc,mem){
+  const norm=normDesc(desc);
+  // exact match
+  if(mem[norm]) return mem[norm];
+  // partial match: check if any memory key is contained in desc or vice versa
+  for(const [key,val] of Object.entries(mem)){
+    if(key.length>=4 && (norm.includes(key) || key.includes(norm))) return val;
+  }
+  return null;
+}
+
 const fmtBRL     = v => new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(v||0);
 const parseBRL   = s => parseFloat((s||'').replace(/\./g,'').replace(',','.'))||0;
 const hexRgba    = (h,a) => { try{const r=parseInt(h.slice(1,3),16),g=parseInt(h.slice(3,5),16),b=parseInt(h.slice(5,7),16);return `rgba(${r},${g},${b},${a})`;}catch{return `rgba(100,100,100,${a})`;} };
@@ -167,7 +203,9 @@ async function extractTx(pdfData){
       const desc=row.items.filter(i=>i.x>50&&i.x<340&&i.text!=='-').map(i=>i.text).join(' ').trim(); if(!desc)continue;
       const ic=ai.text.startsWith('+'), val=parseBRL(ai.text.replace(/[^0-9.,]/g,'')); if(!val)continue;
       const key=date+desc+ai.text; if(seen.has(key))continue; seen.add(key);
-      txs.push({date,desc,category:ic?'💳 Pagamento':categorize(desc),amount:ic?val:-val,isCredit:ic});
+      // smart memory: check history before falling back to keyword categorize
+      const rawCat = ic ? '💳 Pagamento' : categorize(desc);
+      txs.push({date,desc,category:rawCat,amount:ic?val:-val,isCredit:ic,note:'',fromMemory:false});
     }
   }
   return txs;
@@ -179,16 +217,36 @@ window.handleFile=async file=>{
     const tx=await extractTx(new Uint8Array(await file.arrayBuffer()));
     const sp=tx.filter(t=>!t.isCredit);
     if(!sp.length){ showPdfSt('error','⚠️ Nenhuma transação encontrada.'); return; }
+    // Apply smart memory
+    const mem=buildMemory();
+    let memHits=0;
+    sp.forEach(t=>{
+      const match=memoryMatch(t.desc,mem);
+      if(match && match.category !== '❓ Outros'){
+        const wasOthers = t.category === '❓ Outros';
+        // Always apply memory if the keyword-based result was Outros, or if memory has a specific match
+        if(wasOthers || match.count>=2){
+          t.category=match.category;
+          t.note=t.note||match.note||'';
+          t.fromMemory=true;
+          memHits++;
+        }
+      }
+    });
     document.getElementById('pdfStatus').style.display='none';
-    _pendingTx=sp; showReview(sp,file.name);
+    _pendingTx=sp;
+    showReview(sp,file.name,memHits);
   }catch(e){ showPdfSt('error','❌ '+e.message); }
 };
 function showPdfSt(type,msg){ const el=document.getElementById('pdfStatus'); el.className=type; el.style.display='flex'; el.innerHTML=type==='loading'?`<div class="spinner"></div><span>${msg}</span>`:`<span>${msg}</span>`; }
 
 // ═══════ REVIEW ═══════
-function showReview(txs,fname){
+function showReview(txs,fname,memHits=0){
   document.getElementById('reviewPanel').style.display='block';
   document.getElementById('rvMeta').textContent=`${fname} • ${txs.length} transações`;
+  const mb=document.getElementById('memoryBadge');
+  if(memHits>0){ mb.style.display='flex'; mb.innerHTML=`🧠 <strong>${memHits} categoria${memHits>1?'s':''}</strong> aplicada${memHits>1?'s':''} automaticamente pelo histórico — confira e ajuste se precisar`; }
+  else mb.style.display='none';
   buildRvKpis(txs); buildRvBars(txs); buildTxTable(txs);
   document.getElementById('txSearch').oninput=filterTx;
   document.getElementById('txCatFilter').onchange=filterTx;
@@ -214,16 +272,19 @@ function buildRvBars(txs){
   setTimeout(()=>document.querySelectorAll('.bar-fill').forEach(e=>e.style.width=e.dataset.pct+'%'),80);
 }
 function buildTxTable(txs){
-  // txs may be a filtered subset — each item must carry its original index in _pendingTx
   const opts=allLabels();
   document.getElementById('txTable').innerHTML=txs.map(t=>{
-    const origIdx=_pendingTx.indexOf(t); // always use original index
+    const origIdx=_pendingTx.indexOf(t);
     const info=getCatInfo(t.category);
     const sel=opts.map(l=>`<option value="${l}"${l===t.category?' selected':''}>${l}</option>`).join('');
-    return `<div class="tbl-row tbl-cols-tx">
+    const memBadge=t.fromMemory?`<span class="mem-badge">🧠</span>`:'';
+    return `<div class="tbl-row tbl-cols-tx5">
       <span class="date-muted">${t.date}</span>
-      <span class="desc-cell" title="${t.desc}">${t.desc}</span>
-      <span><select class="cat-select" data-i="${origIdx}" onchange="txChangeCat(this)" style="border-color:${hexRgba(info.color,.4)};color:${info.color}">${sel}</select></span>
+      <span>
+        <div class="desc-cell" title="${t.desc}">${t.desc}</div>
+        <input class="note-inp" placeholder="+ nota (opcional)" value="${t.note||''}" data-i="${origIdx}" oninput="txChangeNote(this)">
+      </span>
+      <span style="display:flex;align-items:center;gap:4px">${memBadge}<select class="cat-select" data-i="${origIdx}" onchange="txChangeCat(this)" style="border-color:${hexRgba(info.color,.4)};color:${info.color}">${sel}</select></span>
       <span class="amt-red">${fmtBRL(Math.abs(t.amount))}</span>
     </div>`;
   }).join('');
@@ -250,6 +311,10 @@ window.filterTx=()=>{
   // Filter from _pendingTx but preserve original references (for indexOf to work)
   buildTxTable(_pendingTx.filter(t=>(!q||t.desc.toLowerCase().includes(q))&&(!cat||t.category===cat)));
 };
+window.txChangeNote=inp=>{
+  const i=parseInt(inp.dataset.i);
+  if(!isNaN(i)&&_pendingTx[i]) _pendingTx[i].note=inp.value;
+};
 window.cancelReview=()=>{ document.getElementById('reviewPanel').style.display='none'; _pendingTx=null; };
 
 // ═══════ SAVE MONTH (with updated categories) ═══════
@@ -257,13 +322,17 @@ window.saveMonth=async()=>{
   if(!_pendingTx) return;
   const m=document.getElementById('rvMonth').value, y=document.getElementById('rvYear').value;
   const key=mkKey(y,m);
-  // Re-read all selects in DOM to capture final categories
+  const monthNote=document.getElementById('rvMonthNote')?.value||'';
+  // Re-read all selects + notes from DOM to capture final state
   document.querySelectorAll('#txTable .cat-select').forEach(sel=>{
     const i=parseInt(sel.dataset.i); if(!isNaN(i)&&_pendingTx[i]) _pendingTx[i].category=sel.value;
   });
+  document.querySelectorAll('#txTable .note-inp').forEach(inp=>{
+    const i=parseInt(inp.dataset.i); if(!isNaN(i)&&_pendingTx[i]) _pendingTx[i].note=inp.value;
+  });
   const byCat={}; _pendingTx.forEach(t=>{ byCat[t.category]=(byCat[t.category]||0)+Math.abs(t.amount); });
   const total=_pendingTx.reduce((s,t)=>s+Math.abs(t.amount),0);
-  const data={transactions:[..._pendingTx],byCat,total,label:keyLabel(key),savedAt:new Date().toISOString()};
+  const data={transactions:[..._pendingTx],byCat,total,label:keyLabel(key),note:monthNote,savedAt:new Date().toISOString()};
   MONTHS[key]=data;
   try{ await setDoc(mRef(key),data); toast(`✅ <strong>${keyLabel(key)}</strong> salvo!`); }
   catch(e){ toast('⚠️ Erro: '+e.message,'warn'); }
@@ -655,6 +724,7 @@ window.renderHistorico=()=>{
     return `<div class="hist-entry" id="he-${key}">
       <div class="hist-entry-hdr" onclick="toggleHist('${key}')">
         <div><div style="font-family:'Syne',sans-serif;font-size:13px;font-weight:700">${keyLabel(key)}</div>
+        ${m?.note?`<div style="font-size:11px;color:var(--accent);margin-top:2px">📝 ${m.note}</div>`:''}
         <div style="font-size:11px;color:var(--muted);margin-top:2px">Salvo ${m?.savedAt?new Date(m.savedAt).toLocaleDateString('pt-BR'):'-'}</div></div>
         <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
           ${m?`<span style="font-size:12px;color:var(--accent)">Cartão: ${fmtBRL(m.total)}</span>`:''}
@@ -693,6 +763,10 @@ window.editMonth=key=>{
   showPage('pg-fatura');
   document.getElementById('reviewPanel').style.display='block';
   document.getElementById('rvMeta').textContent=`Editando: ${keyLabel(key)} • ${_pendingTx.length} transações`;
+  document.getElementById('memoryBadge').style.display='none';
+  // Pre-fill month note if exists
+  const noteEl=document.getElementById('rvMonthNote');
+  if(noteEl) noteEl.value=m.note||'';
   // pre-select month/year
   const [y,mo]=key.split('-');
   document.getElementById('rvYear').value=y;
@@ -843,6 +917,11 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
 .tbl-row{display:grid;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px;transition:background .12s;align-items:center}
 .tbl-row:last-child{border-bottom:none}.tbl-row:hover{background:rgba(255,255,255,.02)}
 .tbl-cols-tx{grid-template-columns:82px 1fr 155px 98px}
+.tbl-cols-tx5{grid-template-columns:82px 1fr 175px 98px}
+.note-inp{width:100%;background:transparent;border:none;border-bottom:1px dashed rgba(255,255,255,.1);color:var(--muted);font-family:'DM Mono',monospace;font-size:10px;padding:2px 0;margin-top:3px;outline:none;transition:border-color .2s}
+.note-inp:focus{border-bottom-color:var(--accent);color:var(--text)}
+.note-inp::placeholder{color:rgba(107,114,128,.5)}
+.mem-badge{font-size:11px;background:rgba(34,197,94,.15);color:var(--green);border-radius:4px;padding:1px 5px;flex-shrink:0}
 .cat-select{font-family:'DM Mono',monospace;font-size:11px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:3px 7px;cursor:pointer;outline:none;color:var(--text);transition:border-color .15s;width:148px}
 .cat-select:focus{border-color:var(--accent)}
 .date-muted{color:var(--muted);font-size:11px}
@@ -964,24 +1043,26 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
   <div id="pdfStatus"></div>
   <div id="reviewPanel" style="display:none">
     <h3>✅ Revise e salve</h3>
-    <div id="rvMeta" style="margin-bottom:10px;font-size:12px;color:var(--muted)"></div>
+    <div id="rvMeta" style="margin-bottom:8px;font-size:12px;color:var(--muted)"></div>
+    <div id="memoryBadge" class="alert success" style="display:none;margin-bottom:10px"></div>
     <div style="display:flex;gap:10px;align-items:flex-end;margin-bottom:12px;flex-wrap:wrap">
       <div><div class="f-label">Mês</div>
         <select class="f-select" id="rvMonth" style="width:130px">
           <option value="1">Janeiro</option><option value="2">Fevereiro</option><option value="3">Março</option><option value="4">Abril</option><option value="5">Maio</option><option value="6">Junho</option><option value="7">Julho</option><option value="8">Agosto</option><option value="9">Setembro</option><option value="10">Outubro</option><option value="11">Novembro</option><option value="12">Dezembro</option>
         </select></div>
       <div><div class="f-label">Ano</div><select class="f-select" id="rvYear" style="width:90px"></select></div>
+      <div style="flex:1;min-width:200px"><div class="f-label">📝 Descrição do mês (opcional)</div><input class="f-input" id="rvMonthNote" placeholder="Ex: Mês com viagem pra SP, comprei celular parcelado…"></div>
     </div>
     <div class="kpi-grid" id="rvKpis"></div>
     <div class="section-title">Por Categoria</div>
     <div id="rvBars" style="margin-bottom:16px"></div>
-    <div class="section-title">Transações <span style="font-size:11px;color:var(--muted);font-weight:400;margin-left:6px">— ajuste a categoria se necessário</span></div>
+    <div class="section-title">Transações <span style="font-size:11px;color:var(--muted);font-weight:400;margin-left:6px">— altere categoria e adicione notas por transação</span></div>
     <div class="filter-row">
       <input class="srch-inp" id="txSearch" placeholder="Buscar…">
       <select class="fil-sel" id="txCatFilter"><option value="">Todas</option></select>
     </div>
     <div class="card tbl-wrap">
-      <div class="tbl-head tbl-cols-tx"><span>DATA</span><span>DESCRIÇÃO</span><span>CATEGORIA</span><span style="text-align:right">VALOR</span></div>
+      <div class="tbl-head tbl-cols-tx5"><span>DATA</span><span>DESCRIÇÃO + NOTA</span><span>CATEGORIA</span><span style="text-align:right">VALOR</span></div>
       <div class="tbl-scroll" id="txTable"></div>
     </div>
     <div style="display:flex;gap:9px;margin-top:14px;flex-wrap:wrap">

@@ -50,6 +50,7 @@ let MONTHS = {};
 let FIXOS  = {};
 let INVEST = {};
 let MANUAL = {};   // manual card entries: key -> {cartao:'Neon', transactions:[]}
+let PARCELAS = [];  // [{desc, val, parAtual, parTotal, startKey, cat}]
 let _uid   = null;
 let _pendingTx = null;
 let _pendingCartao = 'Inter'; // which card is being imported
@@ -145,6 +146,11 @@ async function loadAll(){
       const manSnap=await getDocs(collection(db,'users',_uid,'manual'));
       MANUAL={}; manSnap.forEach(d=>MANUAL[d.id]=d.data());
     }catch(e){}
+    // Load parcelas
+    try{
+      const pSnap=await getDoc(pRef());
+      if(pSnap.exists()) PARCELAS=pSnap.data().list||[];
+    }catch(e){}
   }catch(e){ toast('⚠️ Erro ao carregar: '+e.message,'warn'); }
   showLoader(false);
 }
@@ -174,7 +180,7 @@ window.showPage=id=>{
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  const map={'pg-receitas':0,'pg-fatura':1,'pg-fixos':2,'pg-demo':3,'pg-invest':4,'pg-dashboard':5,'pg-historico':6};
+  const map={'pg-receitas':0,'pg-fatura':1,'pg-fixos':2,'pg-demo':3,'pg-invest':4,'pg-proj':5,'pg-dashboard':6,'pg-historico':7};
   document.querySelectorAll('.nav-tab')[map[id]]?.classList.add('active');
   if(id==='pg-dashboard') renderDashboard();
   if(id==='pg-historico') renderHistorico();
@@ -182,6 +188,7 @@ window.showPage=id=>{
   if(id==='pg-receitas')  loadReceitas();
   if(id==='pg-demo')      renderDemo();
   if(id==='pg-invest')    loadInvest();
+  if(id==='pg-proj')      renderProjecao();
 };
 
 // ═══════ YEAR SELECTORS ═══════
@@ -385,6 +392,7 @@ window.saveMonth=async()=>{
 
 // ═══════ MANUAL CARDS (Neon, Carrefour etc) ═══════
 const manRef = k => doc(db,'users',_uid,'manual',k);
+const pRef   = ()  => doc(db,'users',_uid,'parcelas','list');
 
 window.loadManualCard=()=>{
   const m=document.getElementById('rvMonth').value, y=document.getElementById('rvYear').value;
@@ -742,6 +750,224 @@ function buildThermometer(receita,gastoFixo,gastoCard,saldo){
       <div style="font-size:11px;color:var(--muted)">Regra 50/30/20 — Fixos ≤50% · Variável ≤30% · Poupança ≥20%</div>
     </div>`;
 }
+
+
+// ═══════ PROJEÇÃO ═══════
+const PROJ_JS_LOADED = true;
+
+// Helpers
+function getLastNMonths(n){
+  const now=new Date(), res=[];
+  for(let i=n;i>=1;i--){
+    const d=new Date(now.getFullYear(),now.getMonth()-i,1);
+    res.push(mkKey(d.getFullYear(),d.getMonth()+1));
+  }
+  return res;
+}
+function parcelaFutureByMonth(){
+  // returns {key: totalParcelas} for all future months
+  const now=new Date();
+  const res={};
+  PARCELAS.forEach(p=>{
+    if(!p.startKey||!p.val||!p.parAtual||!p.parTotal) return;
+    const [sy,sm]=p.startKey.split('-').map(Number);
+    const startDate=new Date(sy,sm-1,1);
+    for(let i=0;i<p.parTotal;i++){
+      const d=new Date(startDate.getFullYear(),startDate.getMonth()+i,1);
+      const k=mkKey(d.getFullYear(),d.getMonth()+1);
+      res[k]=(res[k]||0)+p.val;
+    }
+  });
+  return res;
+}
+function calcTrend(vals){
+  // simple linear regression slope
+  if(vals.length<2) return 0;
+  const n=vals.length, sumX=n*(n-1)/2, sumY=vals.reduce((a,b)=>a+b,0);
+  const sumXY=vals.reduce((s,v,i)=>s+i*v,0), sumX2=vals.reduce((s,_,i)=>s+i*i,0);
+  return (n*sumXY-sumX*sumY)/(n*sumX2-sumX*sumX);
+}
+
+window.saveParcelas=async()=>{
+  try{ await setDoc(pRef(),{list:PARCELAS}); toast('✅ Parcelas salvas!'); }
+  catch(e){ toast('⚠️ '+e.message,'warn'); }
+};
+window.addParcela=()=>{
+  PARCELAS.push({desc:'',val:0,parAtual:1,parTotal:12,startKey:mkKey(new Date().getFullYear(),new Date().getMonth()+1),cat:'🏠 Casa & Compras'});
+  renderParcelas();
+};
+window.rmParcela=i=>{ PARCELAS.splice(i,1); renderParcelas(); };
+function renderParcelas(){
+  const el=document.getElementById('parcelasList');
+  if(!el) return;
+  el.innerHTML=PARCELAS.map((p,i)=>`
+    <div class="fixo-row" style="grid-template-columns:1fr 90px 60px 60px 110px 28px;gap:6px;align-items:center">
+      <input class="f-input" placeholder="Descrição (ex: Celular Samsung)" value="${p.desc||''}"
+        oninput="PARCELAS[${i}].desc=this.value">
+      <input class="f-input" placeholder="R$ parcela" value="${p.val?(p.val.toFixed(2).replace('.',',')):'0,00'}" style="text-align:right"
+        oninput="PARCELAS[${i}].val=parseBRL(this.value);renderProjecao()">
+      <input class="f-input" type="number" min="1" placeholder="Atual" value="${p.parAtual||1}" style="text-align:center"
+        oninput="PARCELAS[${i}].parAtual=parseInt(this.value)||1;syncParcelaStart(${i})">
+      <input class="f-input" type="number" min="1" placeholder="Total" value="${p.parTotal||12}" style="text-align:center"
+        oninput="PARCELAS[${i}].parTotal=parseInt(this.value)||12;renderProjecao()">
+      <input class="f-input" type="month" value="${p.startKey||''}" title="Mês da 1ª parcela"
+        oninput="PARCELAS[${i}].startKey=this.value.replace('-0','-').replace(/(\\d{4})-(\\d)/,'$1-0$2');renderProjecao()" style="padding:6px 7px">
+      <button class="del-btn" onclick="rmParcela(${i});renderProjecao()">🗑</button>
+    </div>`).join('');
+}
+window.syncParcelaStart=i=>{
+  // Recalculate start month from current parcela number
+  const p=PARCELAS[i];
+  const now=new Date();
+  const startM=new Date(now.getFullYear(),now.getMonth()-(p.parAtual-1),1);
+  PARCELAS[i].startKey=mkKey(startM.getFullYear(),startM.getMonth()+1);
+  renderParcelas(); renderProjecao();
+};
+
+window.renderProjecao=()=>{
+  const el=document.getElementById('projContent');
+  if(!el) return;
+
+  const now=new Date();
+  const curKey=mkKey(now.getFullYear(),now.getMonth()+1);
+
+  // ── Data from last 6 months ──
+  const hist=getLastNMonths(6);
+  const histData=hist.map(k=>{
+    const m=MONTHS[k], f=FIXOS[k], man=MANUAL[k];
+    const card=(m?m.total:0)+(man?(man.entries||[]).reduce((s,e)=>s+e.total,0):0);
+    const fixo=f?(f.fixos||[]).reduce((s,f2)=>s+f2.val,0):0;
+    const rec=f?(f.receitas||[]).reduce((s,r)=>s+r.val,0):0;
+    return{key:k,label:keyLabel(k),card,fixo,rec,hasData:!!(m||f)};
+  }).filter(d=>d.hasData);
+
+  const cardVals=histData.map(d=>d.card).filter(v=>v>0);
+  const avgCard=cardVals.length?cardVals.reduce((a,b)=>a+b,0)/cardVals.length:0;
+  const trend=calcTrend(cardVals); // R$/month slope
+  const trendPct=avgCard>0?(trend/avgCard*100):0;
+
+  // Current fixos
+  const curFixo=FIXOS[curKey]?.fixos?.reduce((s,f)=>s+f.val,0)||0;
+  const curRec=FIXOS[curKey]?.receitas?.reduce((s,r)=>s+r.val,0)||
+               histData.slice(-3).filter(d=>d.rec>0).reduce((s,d,_,a)=>s+d.rec/a.length,0);
+
+  // ── Mês atual: extrapolate ──
+  const curMonth=MONTHS[curKey];
+  const daysInMonth=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
+  const dayOfMonth=now.getDate();
+  const spentSoFar=curMonth?curMonth.total:0;
+  const dailyRate=spentSoFar&&dayOfMonth>0?spentSoFar/dayOfMonth:avgCard/daysInMonth;
+  const projCurCard=Math.round(dailyRate*daysInMonth);
+  const projCurTotal=projCurCard+curFixo;
+  const projCurSaldo=curRec-projCurTotal;
+
+  // ── Next 6 months projection ──
+  const parByMonth=parcelaFutureByMonth();
+  const futureMths=[];
+  for(let i=0;i<=5;i++){
+    const d=new Date(now.getFullYear(),now.getMonth()+i,1);
+    const k=mkKey(d.getFullYear(),d.getMonth()+1);
+    const label=MN[d.getMonth()+1].slice(0,3)+' '+(i===0?'(atual)':'');
+    // Project card: avg + trend * i, capped at 2x avg
+    const projCard=i===0?projCurCard:Math.min(Math.max(avgCard+trend*i,avgCard*0.5),avgCard*2);
+    // Fixos: use saved or current
+    const savedFixo=FIXOS[k]?.fixos?.reduce((s,f)=>s+f.val,0)||curFixo;
+    const parcelas=parByMonth[k]||0;
+    const total=projCard+savedFixo+parcelas;
+    const rec=FIXOS[k]?.receitas?.reduce((s,r)=>s+r.val,0)||curRec;
+    futureMths.push({k,label,projCard,savedFixo,parcelas,total,rec,saldo:rec-total,isCur:i===0});
+  }
+
+  // ── Render ──
+  el.innerHTML=`
+    <div class="section-title">📅 Fechamento do Mês Atual</div>
+    <div class="kpi-grid" style="margin-bottom:18px">
+      <div class="kpi accent">
+        <div class="k-label">Gasto até hoje</div>
+        <div class="k-val">${fmtBRL(spentSoFar)}</div>
+        <div class="k-sub">dia ${dayOfMonth} de ${daysInMonth}</div>
+      </div>
+      <div class="kpi ${projCurCard>avgCard*1.1?'red':'blue'}">
+        <div class="k-label">Projeção cartão</div>
+        <div class="k-val">${fmtBRL(projCurCard)}</div>
+        <div class="k-sub">${fmtBRL(dailyRate)}/dia</div>
+      </div>
+      <div class="kpi red">
+        <div class="k-label">+ Fixos do mês</div>
+        <div class="k-val">${fmtBRL(curFixo)}</div>
+        <div class="k-sub">${curFixo?'cadastrados':'não cadastrado'}</div>
+      </div>
+      <div class="kpi ${projCurSaldo>=0?'green':'red'}">
+        <div class="k-label">Saldo projetado</div>
+        <div class="k-val">${fmtBRL(projCurSaldo)}</div>
+        <div class="k-sub">${projCurSaldo>=0?'sobra':'déficit'}</div>
+      </div>
+    </div>
+
+    ${avgCard>0?`<div class="alert ${Math.abs(trendPct)<5?'info':trendPct>0?'warn':'ok'}" style="margin-bottom:18px">
+      ${trendPct>5?'📈':trendPct<-5?'📉':'➡️'} <strong>Tendência dos últimos ${cardVals.length} meses:</strong>
+      ${Math.abs(trendPct)<5?'Gastos estáveis':trendPct>0?`subindo ~${trendPct.toFixed(0)}% ao mês (atenção!)`:`caindo ~${Math.abs(trendPct).toFixed(0)}% ao mês — ótimo!`}
+      · Média cartão: <strong>${fmtBRL(avgCard)}/mês</strong>
+    </div>`:''}
+
+    <div class="section-title">📆 Próximos 6 Meses</div>
+    <div class="proj-table" style="margin-bottom:20px">
+      <div class="proj-head">
+        <span>Mês</span><span>💳 Cartão</span><span>🏠 Fixos</span><span>📦 Parcelas</span><span>Total</span><span>Saldo</span>
+      </div>
+      ${futureMths.map(m=>`
+        <div class="proj-row ${m.isCur?'proj-cur':''} ${m.saldo<0?'proj-neg':''}">
+          <span style="font-weight:${m.isCur?700:400}">${m.label}</span>
+          <span>${fmtBRL(m.projCard)}${m.isCur&&spentSoFar?`<div style="font-size:9px;color:var(--muted)">gasto: ${fmtBRL(spentSoFar)}</div>`:''}</span>
+          <span>${fmtBRL(m.savedFixo)}</span>
+          <span>${m.parcelas>0?`<strong style="color:var(--accent)">${fmtBRL(m.parcelas)}</strong>`:
+            '<span style="color:var(--muted)">—</span>'}</span>
+          <span style="font-weight:600">${fmtBRL(m.total)}</span>
+          <span style="color:${m.saldo>=0?'var(--green)':'var(--red)'};font-weight:600">${fmtBRL(m.saldo)}</span>
+        </div>`).join('')}
+    </div>
+
+    <div class="section-title">📦 Parcelas Futuras</div>
+    <div class="alert info" style="margin-bottom:10px">💡 Cadastre compras parceladas para incluir na projeção. Informe a parcela atual e o total.</div>
+    <div style="display:grid;grid-template-columns:1fr 90px 60px 60px 110px 28px;gap:6px;padding:0 4px;margin-bottom:6px">
+      <span class="tbl-lbl">Descrição</span><span class="tbl-lbl">Valor/parc.</span><span class="tbl-lbl" style="text-align:center">Atual</span><span class="tbl-lbl" style="text-align:center">Total</span><span class="tbl-lbl">1ª parcela</span><span></span>
+    </div>
+    <div id="parcelasList"></div>
+    <div style="display:flex;gap:9px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn btn-secondary btn-sm" onclick="addParcela()">+ Adicionar parcela</button>
+      <button class="btn btn-primary btn-sm" onclick="saveParcelas()">☁️ Salvar parcelas</button>
+    </div>
+  `;
+  renderParcelas();
+
+  // ── Animated bar chart ──
+  const canvas=document.createElement('canvas');
+  canvas.id='chProj';
+  canvas.style.cssText='margin-bottom:20px;max-height:260px';
+  // Insert before the "Próximos 6 meses" title (index 1)
+  const titles=el.querySelectorAll('.section-title');
+  if(titles[1]) titles[1].before(canvas);
+
+  if(window._chProj) window._chProj.destroy();
+  window._chProj=new Chart(canvas.getContext('2d'),{
+    type:'bar',
+    data:{
+      labels:futureMths.map(m=>m.label),
+      datasets:[
+        {label:'Fixos',data:futureMths.map(m=>m.savedFixo),backgroundColor:'rgba(96,165,250,.7)',borderRadius:4},
+        {label:'Parcelas',data:futureMths.map(m=>m.parcelas),backgroundColor:'rgba(167,139,250,.7)',borderRadius:4},
+        {label:'Cartão (proj.)',data:futureMths.map(m=>m.projCard),backgroundColor:'rgba(249,115,22,.65)',borderRadius:4},
+        {label:'Receita',data:futureMths.map(m=>m.rec),type:'line',borderColor:'#22c55e',backgroundColor:'transparent',borderWidth:2,pointRadius:4,tension:.3},
+      ]
+    },
+    options:{responsive:true,plugins:{legend:{labels:{color:'#9ca3af',font:{size:11}}}},
+      scales:{
+        x:{stacked:true,ticks:{color:'#6b7280',font:{size:10}},grid:{color:'rgba(255,255,255,.04)'}},
+        y:{stacked:true,ticks:{color:'#6b7280',font:{size:10},callback:v=>v>=1000?(v/1000).toFixed(1)+'k':v},grid:{color:'rgba(255,255,255,.06)'}}
+      }
+    }
+  });
+};
 
 // ═══════ DASHBOARD ═══════
 window.renderDashboard=()=>{
@@ -1193,6 +1419,15 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
 .add-cat-box{background:rgba(224,25,125,.05);border:1px dashed rgba(224,25,125,.3);border-radius:10px;padding:12px 14px;margin-top:4px}
 .add-cat-box h4{font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:700;color:var(--accent);margin-bottom:10px}
 .add-row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+
+.proj-table{border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+.proj-head{display:grid;grid-template-columns:100px repeat(5,1fr);gap:0;padding:8px 14px;background:rgba(255,255,255,.04);font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.proj-row{display:grid;grid-template-columns:100px repeat(5,1fr);gap:0;padding:10px 14px;border-top:1px solid rgba(255,255,255,.04);font-size:12px;font-family:'DM Mono',monospace;transition:background .15s}
+.proj-row:hover{background:rgba(255,255,255,.03)}
+.proj-cur{background:rgba(249,115,22,.06)!important;border-left:2px solid var(--accent)}
+.proj-neg span:last-child{color:var(--red)!important}
+.tbl-lbl{font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+@media(max-width:700px){.proj-head,.proj-row{grid-template-columns:80px repeat(3,1fr);}.proj-head span:nth-child(4),.proj-row span:nth-child(4){display:none}}
 @media(max-width:700px){.fixo-row{grid-template-columns:1fr 90px 28px}.fixo-row>*:nth-child(3),.fixo-row>*:nth-child(4),.fixo-row>*:nth-child(5),.fixo-row>*:nth-child(6){display:none}.tbl-cols-tx{grid-template-columns:70px 1fr 95px}.tbl-cols-tx>*:nth-child(4){display:none}}
 </style>
 </head>
@@ -1226,6 +1461,7 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
       <button class="nav-tab" onclick="showPage('pg-fixos')">🏠 Gastos Fixos</button>
       <button class="nav-tab" onclick="showPage('pg-demo')">📋 Demonstrativo</button>
       <button class="nav-tab" onclick="showPage('pg-invest')">🎯 Metas</button>
+      <button class="nav-tab" onclick="showPage('pg-proj')">📈 Projeção</button>
       <button class="nav-tab" onclick="showPage('pg-dashboard')">📊 Dashboard</button>
       <button class="nav-tab" onclick="showPage('pg-historico')">🗂️ Histórico</button>
     </div>
@@ -1437,6 +1673,14 @@ nav{position:sticky;top:0;z-index:100;background:rgba(14,15,20,.92);backdrop-fil
   <div class="section-title" style="margin-top:4px">🗂️ Histórico</div>
   <div id="histList"></div>
 </div>
+</div>
+
+
+<!-- PROJEÇÃO -->
+<div class="page" id="pg-proj">
+  <div class="section-title" style="margin-top:4px">📈 Projeção de Gastos</div>
+  <div class="alert info" style="margin-bottom:16px">🔮 Baseado no seu histórico real + fixos cadastrados + parcelas futuras. Quanto mais meses salvos, mais preciso.</div>
+  <div id="projContent"><div class="alert info">Carregando projeção…</div></div>
 </div>
 
 <!-- MODAL CAT -->
